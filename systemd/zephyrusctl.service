@@ -1,0 +1,7 @@
+[Unit]
+Description=Re-apply zephyrusctl ryzenadj limits
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/var/lib/zephyrusctl/ryzenadj.args
+ExecStart=/bin/sh -c '[ -n "$ARGS" ] && exec /usr/bin/ryzenadj $ARGS'

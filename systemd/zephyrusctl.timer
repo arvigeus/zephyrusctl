@@ -1,0 +1,6 @@
+[Unit]
+Description=Periodically re-apply ryzenadj limits
+
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=30s

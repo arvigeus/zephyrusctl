@@ -1,0 +1,5 @@
+[*.sh]
+indent_style = tab
+switch_case_indent = true
+space_redirects = true
+keep_padding = true
