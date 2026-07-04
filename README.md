@@ -83,7 +83,7 @@ Setting a string value for `smu` automatically opts out of `base` inheritance an
 
 The following are inherent to the underlying tools, not bugs in the script.
 
-- **GPU selection applies to new processes only.** The `gpu` field writes Mesa environment variables; existing applications continue to use the GPU they were launched with. Apply the profile before starting the application.
+- **GPU selection applies to new systemd-user-launched processes only.** The `gpu` field sets Mesa environment variables in the runtime user manager environment; existing applications continue to use the GPU they were launched with. Apply the profile before starting the application. Plain `dGPU` and `iGPU` are not written to persistent config, so they are lost after reboot. Use `dGPU!` or `iGPU!` to also write `~/.config/environment.d/zephyrusctl.conf` and keep the selection across sessions.
 - **`powertop --auto-tune` is not reversible.** It persists until the next reboot. Switching to a profile with `powertop: false` does not undo prior tuning.
 - **`ryzenadj` limits drift under load.** AMD's SMU may revise the configured limits upward during sustained workloads. See [FlyGoat/RyzenAdj#374](https://github.com/FlyGoat/RyzenAdj/issues/374). To counter this, any `ryzenadj` preset may set `"persist": true`; a systemd timer then re-asserts the limits every 30 seconds while that profile is active. The shipped `gaming` profile has this enabled.
 - **Profiles do not survive reboot or suspend.** Re-apply manually after waking the system.

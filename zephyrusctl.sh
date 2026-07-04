@@ -13,10 +13,9 @@ IGPU_PCI="1002:1681" # AMD Rembrandt
 DGPU_PCI="1002:73ff" # AMD Navi 23
 DGPU_SLOT="0000:03:00.0"
 
-# Only file the script writes. The gpu knob needs a real file because
-# MESA_VK_DEVICE_SELECT / DRI_PRIME are read from environment.d at session
-# start — there is no in-memory equivalent.
-ENVFILE="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/zephyrusctl.conf"
+# Optional persistent GPU selection. Plain dGPU/iGPU uses only runtime state;
+# dGPU!/iGPU! writes this file so the setting survives reboot.
+GPU_ENVFILE="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/zephyrusctl.conf"
 
 # Optional user overrides. Read once at startup if present.
 USER_CONFIG="$HOME/.config/zephyrusctl.json"
@@ -171,22 +170,37 @@ apply_refresh_rate() {
 }
 
 apply_gpu() {
-	# MESA_VK_DEVICE_SELECT / DRI_PRIME via environment.d only affect NEW
-	# processes spawned after the user session re-reads env. Existing apps
-	# are unchanged. Intended flow: switch profile, then launch Steam.
+	# MESA_VK_DEVICE_SELECT / DRI_PRIME in the systemd user manager only affect
+	# new processes spawned from that manager. Plain dGPU/iGPU values are
+	# in-memory state and disappear when the user manager exits, including on
+	# reboot. Add ! to opt in to environment.d persistence.
 	local mode="$1"
 	[[ -z "$mode" ]] && return 0
-	mkdir -p "$(dirname "$ENVFILE")"
 	case "$mode" in
-		dGPU) printf 'DRI_PRIME=1\nMESA_VK_DEVICE_SELECT=%s!\n' "$DGPU_PCI" > "$ENVFILE" ;;
-		iGPU) printf 'DRI_PRIME=0\nMESA_VK_DEVICE_SELECT=%s!\n' "$IGPU_PCI" > "$ENVFILE" ;;
-		auto) rm -f "$ENVFILE" ;;
-		*) die "invalid gpu: $mode" ;;
+		dGPU)
+			rm -f "$GPU_ENVFILE"
+			systemctl --user set-environment DRI_PRIME=1 "MESA_VK_DEVICE_SELECT=$DGPU_PCI!"
+			;;
+		iGPU)
+			rm -f "$GPU_ENVFILE"
+			systemctl --user set-environment DRI_PRIME=0 "MESA_VK_DEVICE_SELECT=$IGPU_PCI!"
+			;;
+		dGPU!)
+			mkdir -p "$(dirname "$GPU_ENVFILE")"
+			printf 'DRI_PRIME=1\nMESA_VK_DEVICE_SELECT=%s!\n' "$DGPU_PCI" > "$GPU_ENVFILE"
+			systemctl --user set-environment DRI_PRIME=1 "MESA_VK_DEVICE_SELECT=$DGPU_PCI!"
+			;;
+		iGPU!)
+			mkdir -p "$(dirname "$GPU_ENVFILE")"
+			printf 'DRI_PRIME=0\nMESA_VK_DEVICE_SELECT=%s!\n' "$IGPU_PCI" > "$GPU_ENVFILE"
+			systemctl --user set-environment DRI_PRIME=0 "MESA_VK_DEVICE_SELECT=$IGPU_PCI!"
+			;;
+		auto)
+			rm -f "$GPU_ENVFILE"
+			systemctl --user unset-environment DRI_PRIME MESA_VK_DEVICE_SELECT
+			;;
+		*) die "invalid gpu: $mode (use auto, dGPU, iGPU, dGPU!, or iGPU!)" ;;
 	esac
-	# Re-exec the user's systemd manager so apps newly launched under
-	# systemd-user scope pick up the new environment.d values. Already-running
-	# processes and apps not under systemd-user scope still aren't affected.
-	systemctl --user daemon-reexec 2> /dev/null || true
 }
 
 apply_powertop() {
@@ -256,15 +270,15 @@ apply_ryzenadj() {
 
 		local v
 		v=$(jq -r '.stapm_limit   // empty' <<< "$preset")
-		[[ -n "$v"                                         ]] && args+=(--stapm-limit "$((v * 1000))")
+		[[ -n "$v"                                       ]] && args+=(--stapm-limit "$((v * 1000))")
 		v=$(jq -r '.fast_limit    // empty' <<< "$preset")
-		[[ -n "$v"                                         ]] && args+=(--fast-limit "$((v * 1000))")
+		[[ -n "$v"                                       ]] && args+=(--fast-limit "$((v * 1000))")
 		v=$(jq -r '.slow_limit    // empty' <<< "$preset")
-		[[ -n "$v"                                         ]] && args+=(--slow-limit "$((v * 1000))")
+		[[ -n "$v"                                       ]] && args+=(--slow-limit "$((v * 1000))")
 		v=$(jq -r '.cpu_temp      // empty' <<< "$preset")
-		[[ -n "$v"                                         ]] && args+=(--tctl-temp "$v")
+		[[ -n "$v"                                       ]] && args+=(--tctl-temp "$v")
 		v=$(jq -r '.gpu_skin_temp // empty' <<< "$preset")
-		[[ -n "$v"                                         ]] && args+=(--dgpu-skin-temp "$v")
+		[[ -n "$v"                                       ]] && args+=(--dgpu-skin-temp "$v")
 
 		if ((${#args[@]} > 0)); then
 			sleep 1 # let firmware settle after asusctl profile change
@@ -473,13 +487,16 @@ cmd_status() {
 		*) echo "CPU Boost: (unavailable)" ;;
 	esac
 
-	local gpu="auto"
-	if [[ -f "$ENVFILE" ]]; then
-		if grep -q "$DGPU_PCI" "$ENVFILE"; then
-			gpu="dGPU"
-		elif grep -q "$IGPU_PCI" "$ENVFILE"; then
-			gpu="iGPU"
-		fi
+	local gpu="auto" env
+	env=$(systemctl --user show-environment 2> /dev/null || true)
+	if [[ -f "$GPU_ENVFILE" ]] && grep -Fxq "MESA_VK_DEVICE_SELECT=$DGPU_PCI!" "$GPU_ENVFILE"; then
+		gpu="dGPU!"
+	elif [[ -f "$GPU_ENVFILE" ]] && grep -Fxq "MESA_VK_DEVICE_SELECT=$IGPU_PCI!" "$GPU_ENVFILE"; then
+		gpu="iGPU!"
+	elif grep -Fxq "MESA_VK_DEVICE_SELECT=$DGPU_PCI!" <<< "$env"; then
+		gpu="dGPU"
+	elif grep -Fxq "MESA_VK_DEVICE_SELECT=$IGPU_PCI!" <<< "$env"; then
+		gpu="iGPU"
 	fi
 	echo "GPU: $gpu"
 	local runtime
