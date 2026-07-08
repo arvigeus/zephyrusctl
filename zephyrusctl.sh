@@ -98,7 +98,10 @@ read -r -d '' CONFIG << 'JSON' || true
       "asus_profile": "Performance",
       "gpu": "dGPU",
       "ryzenadj": "max-performance"
-    }
+    },
+    "dgpu": { "gpu": "dGPU!" },
+    "igpu": { "gpu": "iGPU!" },
+    "hybrid": { "gpu": "auto" }
   }
 }
 JSON
@@ -386,6 +389,335 @@ read_fan_rpm() {
 	echo $(((v + 50) / 100 * 100))
 }
 
+display_status_kde() {
+	command -v kscreen-doctor > /dev/null || return 1
+
+	local json
+	json=$(kscreen-doctor -j 2> /dev/null) || return 1
+	[[ -n "$json" ]] || return 1
+
+	jq -er --arg n "$PANEL_NAME" '
+        def refresh_suffix($m):
+          ($m.refreshRate // $m.refresh // null) as $r
+          | if $r == null then ""
+            else
+              " @ " + (
+                if ($r | type) == "number"
+                then (if $r > 1000 then ($r / 1000) else $r end | tostring)
+                else ($r | tostring)
+                end
+              ) + " Hz"
+            end;
+        def mode_text($m):
+          if ($m | type) != "object" then empty
+          elif $m.size.width? and $m.size.height?
+          then "\($m.size.width)x\($m.size.height)" + refresh_suffix($m)
+          elif $m.name?
+          then ($m.name | tostring | sub("@"; " @ ") | sub("Hz$"; " Hz"))
+          else empty
+          end;
+        .outputs[]?
+        | select(.name == $n or .type == "Panel" or .type == "panel")
+        | . as $o
+        | ($o.currentMode // ($o.modes[]? | select((.id | tostring) == ($o.currentModeId | tostring))) // {}) as $m
+        | "  internal: \($o.name)",
+          "    backend: KDE",
+          "    state:   \(if ($o.enabled // false) then "enabled" else "disabled" end)",
+	          (if ($o.enabled // false) then
+	             (mode_text($m) as $mode | if $mode == "" then empty else "    mode:    \($mode)" end),
+	             (if $o.scale? then "    scale:   \($o.scale)x" else empty end),
+	             (if $o.primary? then "    primary: \($o.primary)" else empty end)
+	           else empty end)
+	    ' <<< "$json" | head -n 8
+}
+
+display_status_hyprland() {
+	command -v hyprctl > /dev/null || return 1
+
+	local json
+	json=$(hyprctl monitors -j 2> /dev/null) || return 1
+	[[ -n "$json" ]] || return 1
+
+	jq -er --arg n "$PANEL_NAME" '
+        .[]?
+        | select(.name == $n or (.name | test("^(eDP|LVDS|DSI)-")))
+        | "  internal: \(.name)",
+	          "    backend: Hyprland",
+	          "    state:   \(if (.disabled // false) then "disabled" else "enabled" end)",
+	          (if (.disabled // false) then empty else "    mode:    \(.width)x\(.height) @ \(.refreshRate) Hz" end),
+	          (if (.disabled // false) then empty else "    scale:   \(.scale)x" end),
+	          (if (.focused? // false) then "    focused: true" else empty end)
+	    ' <<< "$json" | head -n 8
+}
+
+display_status_wayland_info() {
+	command -v wayland-info > /dev/null || return 1
+
+	wayland-info 2> /dev/null | awk -v panel="$PANEL_NAME" '
+        function flush() {
+            if (name == "") return
+            if (name == panel || name ~ /^(eDP|LVDS|DSI)-/) {
+                print "  internal: " name
+                print "    backend: Wayland"
+	                print "    state:   enabled"
+	                if (mode != "") print "    mode:    " mode
+	                if (scale != "") print "    scale:   " scale "x"
+	                found = 1
+	                exit 0
+	            }
+        }
+        /^interface: .wl_output/ {
+	            flush()
+	            in_output = 1
+	            name = mode = scale = ""
+	            current = 0
+	            next
+	        }
+        /^interface:/ && in_output {
+            flush()
+            in_output = 0
+            next
+        }
+        !in_output { next }
+        /^[[:space:]]*name: / {
+            sub(/^[[:space:]]*name: /, "")
+            gsub(/^'\''|'\''$/, "")
+            if ($0 !~ /^[0-9]+$/) name = $0
+            next
+        }
+	        /^[[:space:]]*scale: / {
+	            scale = $2
+	            next
+        }
+        /^[[:space:]]*width: / {
+            width = $2
+            next
+        }
+        /^[[:space:]]*height: / {
+            height = $2
+            next
+        }
+        /^[[:space:]]*refresh: / {
+            refresh = $2
+            next
+        }
+        /^[[:space:]]*flags: .*current/ {
+            if (width != "" && height != "") mode = width "x" height " @ " refresh " Hz"
+            next
+        }
+        END {
+            if (!found) flush()
+            if (!found) exit 1
+        }
+    '
+}
+
+display_status_wlr() {
+	command -v wlr-randr > /dev/null || return 1
+
+	wlr-randr 2> /dev/null | awk -v panel="$PANEL_NAME" '
+        function flush() {
+            if (!in_output) return
+            if (name == panel || name ~ /^(eDP|LVDS|DSI)-/) {
+                print "  internal: " name
+                print "    backend: wlroots"
+	                print "    state:   " (enabled == "yes" ? "enabled" : "disabled")
+	                if (enabled == "yes" && mode != "") print "    mode:    " mode
+	                if (enabled == "yes" && scale != "") print "    scale:   " scale "x"
+	                found = 1
+	                exit 0
+	            }
+        }
+	        /^[^[:space:]]/ {
+	            flush()
+	            in_output = 1
+	            name = $1
+	            enabled = mode = scale = ""
+	            next
+	        }
+        !in_output { next }
+        /^[[:space:]]*Enabled:/ {
+            enabled = $2
+            next
+        }
+        /^[[:space:]]*Scale:/ {
+            scale = $2
+            next
+        }
+	        /\(.*current.*\)/ {
+	            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/ px, /, " @ ", line)
+            sub(/ Hz.*/, " Hz", line)
+            mode = line
+            next
+        }
+        END {
+            if (!found) flush()
+            if (!found) exit 1
+        }
+    '
+}
+
+display_status_gnome() {
+	command -v gdctl > /dev/null || return 1
+
+	local out enabled
+	out=$(gdctl show 2> /dev/null) || return 1
+	[[ -n "$out" ]] || return 1
+	if sed -n '/Logical monitors:/,$p' <<< "$out" | grep -q "$PANEL_NAME"; then
+		enabled=enabled
+	else
+		enabled=disabled
+	fi
+
+	printf '  internal: %s\n' "$PANEL_NAME"
+	printf '    backend: GNOME\n'
+	printf '    state:   %s\n' "$enabled"
+}
+
+normalize_refresh_rate() {
+	awk -v r="$1" 'BEGIN {
+        if (r == "") exit 1
+        sub(/Hz$/, "", r)
+        if (r + 0 == int(r + 0)) printf "%d\n", r + 0
+        else printf "%.2f\n", r + 0
+    }'
+}
+
+drm_refresh_from_edid() {
+	command -v edid-decode > /dev/null || return 1
+
+	local dir="$1" mode="$2"
+	[[ -r "$dir/edid" ]] || return 1
+
+	edid-decode "$dir/edid" 2> /dev/null | awk -v mode="$mode" '
+        $1 == "DTD" && $3 == mode && $5 == "Hz" {
+            print $4
+            found = 1
+            exit
+        }
+        END { if (!found) exit 1 }
+    ' | {
+		read -r refresh
+		normalize_refresh_rate "$refresh"
+	}
+}
+
+drm_refresh_rate() {
+	local dir="$1" mode="$2"
+
+	drm_refresh_from_edid "$dir" "$mode"
+}
+
+display_status_drm() {
+	local d enabled refresh status mode name chosen=""
+
+	for d in /sys/class/drm/card*-*; do
+		[[ -d "$d" ]] || continue
+		name=${d##*/}
+		name=${name#card*-}
+		[[ "$name" == "$PANEL_NAME" ]] || continue
+		chosen="$d"
+		break
+	done
+
+	if [[ -z "$chosen" ]]; then
+		for d in /sys/class/drm/card*-*; do
+			[[ -d "$d" ]] || continue
+			name=${d##*/}
+			name=${name#card*-}
+			[[ "$name" =~ ^(eDP|LVDS|DSI)- ]] || continue
+			status=$(cat "$d/status" 2> /dev/null || echo unknown)
+			enabled=$(cat "$d/enabled" 2> /dev/null || echo unknown)
+			[[ "$status" == "connected" || "$enabled" == "enabled" ]] || continue
+			chosen="$d"
+			break
+		done
+	fi
+
+	if [[ -z "$chosen" ]]; then
+		for d in /sys/class/drm/card*-*; do
+			[[ -d "$d" ]] || continue
+			name=${d##*/}
+			name=${name#card*-}
+			[[ "$name" =~ ^(eDP|LVDS|DSI)- ]] || continue
+			chosen="$d"
+			break
+		done
+	fi
+
+	[[ -n "$chosen" ]] || return 1
+
+	d="$chosen"
+	name=${d##*/}
+	name=${name#card*-}
+	status=$(cat "$d/status" 2> /dev/null || echo unknown)
+	enabled=$(cat "$d/enabled" 2> /dev/null || echo unknown)
+	mode=$(head -n 1 "$d/modes" 2> /dev/null || true)
+	refresh=""
+	if [[ -n "$mode" ]]; then
+		refresh=$(drm_refresh_rate "$d" "$mode" 2> /dev/null || true)
+	fi
+
+	printf '  internal: %s\n' "$name"
+	printf '    backend: DRM\n'
+	printf '    state:   %s\n' "$enabled"
+	printf '    status:  %s\n' "$status"
+	if [[ -n "$mode" && -n "$refresh" ]]; then
+		printf '    mode:    %s @ %s Hz\n' "$mode" "$refresh"
+	elif [[ -n "$mode" ]]; then
+		printf '    mode:    %s\n' "$mode"
+	fi
+	return 0
+}
+
+print_internal_display_status() {
+	echo "Display:"
+	if display_status_kde ||
+		display_status_hyprland ||
+		display_status_wayland_info ||
+		display_status_wlr ||
+		display_status_gnome ||
+		display_status_drm; then
+		return 0
+	fi
+
+	printf '  internal: %s\n' "$PANEL_NAME"
+	printf '    state:   unavailable\n'
+}
+
+find_battery() {
+	local d type
+	for d in /sys/class/power_supply/*; do
+		[[ -e "$d/type" ]] || continue
+		type=$(cat "$d/type" 2> /dev/null || true)
+		[[ "$type" == "Battery" ]] || continue
+		echo "$d"
+		return 0
+	done
+	return 1
+}
+
+print_battery_status() {
+	local bat capacity limit status
+	bat=$(find_battery) || return 0
+
+	capacity=$(cat "$bat/capacity" 2> /dev/null || true)
+	status=$(cat "$bat/status" 2> /dev/null || true)
+	limit=$(cat "$bat/charge_control_end_threshold" 2> /dev/null || true)
+
+	echo "Battery:"
+	printf '  name:         %s\n' "${bat##*/}"
+	[[ -n "$status"   ]] && printf '  status:       %s\n' "$status"
+	[[ -n "$capacity" ]] && printf '  capacity:     %s%%\n' "$capacity"
+	if [[ -n "$limit" ]]; then
+		printf '  charge-limit: %s%%\n' "$limit"
+	else
+		printf '  charge-limit: unavailable\n'
+	fi
+}
+
 update_minmax() {
 	local -n _min="min_$1" _max="max_$1"
 	local v="$2"
@@ -508,10 +840,12 @@ cmd_status() {
 	if [[ "$runtime" == "active" ]]; then
 		echo "    state:   $(cat "/sys/bus/pci/devices/$DGPU_SLOT/power_state" 2> /dev/null || echo unknown)"
 	fi
+	print_internal_display_status
+	print_battery_status
 
 	if command -v asusctl > /dev/null; then
 		local prof
-		prof=$(asusctl profile get 2> /dev/null | awk -F': ' '/Active profile/{print $2; exit}')
+		prof=$(asusctl profile get 2> /dev/null | awk -F': ' '/Active profile/{print $2; exit}' || true)
 		echo "asusctl: ${prof:-unknown}"
 	fi
 
@@ -526,7 +860,7 @@ cmd_status() {
             /THM LIMIT CORE/ { printf "  %-15s %3s °C\n", "tctl-temp:",      num($3) }
             /STT LIMIT APU/  { printf "  %-15s %3s °C\n", "apu-skin-temp:",  num($3) }
             /STT LIMIT dGPU/ { printf "  %-15s %3s °C\n", "dgpu-skin-temp:", num($3) }
-        '
+        ' || true
 	fi
 }
 
